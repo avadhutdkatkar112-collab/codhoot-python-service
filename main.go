@@ -16,10 +16,12 @@ import (
 )
 
 const (
-	maxOutputSize    = 512 * 1024
-	maxSourceSize    = 100 * 1024
-	maxExecTime      = 10 * time.Second
-	workspaceDir     = "/tmp/codhoot-workspace"
+	maxOutputSize     = 512 * 1024 // 512KB
+	maxSourceSize     = 100 * 1024 // 100KB
+	maxExecTime       = 10 * time.Second
+	maxConcurrentJobs = 4
+	workspaceDir      = "/tmp/codhoot-workspace"
+	srcFilename       = "main.py"
 )
 
 type CompileRequest struct {
@@ -42,6 +44,8 @@ type HealthResponse struct {
 	Timestamp string `json:"timestamp"`
 }
 
+var jobSem = make(chan struct{}, maxConcurrentJobs)
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -58,6 +62,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /compile", handleCompile)
+	mux.HandleFunc("GET /health/live", handleHealth)
 	mux.HandleFunc("GET /health", handleHealth)
 	mux.HandleFunc("GET /", handleIndex)
 
@@ -67,7 +72,7 @@ func main() {
 		Addr:         ":" + port,
 		Handler:      handler,
 		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 30 * time.Second,
+		WriteTimeout: maxExecTime + 10*time.Second,
 		IdleTimeout:  60 * time.Second,
 	}
 
@@ -88,7 +93,7 @@ func main() {
 }
 
 func handleHealth(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	json.NewEncoder(w).Encode(HealthResponse{
 		Status:    "healthy",
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
@@ -96,12 +101,48 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleIndex(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	json.NewEncoder(w).Encode(map[string]string{
 		"service": "codhoot-python-compiler",
-		"version": "1.0.0",
+		"version": "2.0.0",
 		"usage":   "POST /compile with {\"source\": \"...\"}",
 	})
+}
+
+// runCommand runs a command, killing the whole process group on timeout so
+// orphaned children never accumulate on the 512MB container.
+func runCommand(parent context.Context, timeout time.Duration, dir string, name string, args ...string) ([]byte, int, bool) {
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Dir = dir
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
+	killGroup := func() {
+		for i := 0; i < 200 && (cmd.Process == nil || cmd.Process.Pid <= 0); i++ {
+			time.Sleep(10 * time.Millisecond)
+		}
+		if cmd.Process != nil && cmd.Process.Pid > 0 {
+			syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		}
+	}
+	go func() {
+		<-ctx.Done()
+		killGroup()
+	}()
+
+	out, err := cmd.CombinedOutput()
+	if ctx.Err() == context.DeadlineExceeded {
+		return out, -1, true
+	}
+	if err != nil {
+		if ee, ok := err.(*exec.ExitError); ok {
+			return out, ee.ExitCode(), false
+		}
+		return out, 1, false
+	}
+	return out, 0, false
 }
 
 func handleCompile(w http.ResponseWriter, r *http.Request) {
@@ -119,7 +160,15 @@ func handleCompile(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if len(req.Source) > maxSourceSize {
-		writeError(w, http.StatusBadRequest, fmt.Sprintf("Source code exceeds %d bytes", maxSourceSize), 0, 0)
+		writeError(w, http.StatusBadRequest, "Source code exceeds maximum size", 0, 0)
+		return
+	}
+
+	select {
+	case jobSem <- struct{}{}:
+		defer func() { <-jobSem }()
+	case <-r.Context().Done():
+		writeError(w, http.StatusServiceUnavailable, "Compiler is busy, try again", 0, 0)
 		return
 	}
 
@@ -128,75 +177,47 @@ func handleCompile(w http.ResponseWriter, r *http.Request) {
 	os.MkdirAll(jobDir, 0755)
 	defer os.RemoveAll(jobDir)
 
-	output, exitCode, execMs, timeout, truncated := runPython(jobDir, req.Source)
-
-	resp := CompileResponse{
-		Success:         exitCode == 0,
-		Output:          output,
-		ExitCode:        exitCode,
-		CompileTime:     0,
-		ExecuteTime:     execMs,
-		Timeout:         timeout,
-		OutputTruncated: truncated,
-	}
-
-	if exitCode != 0 && output == "" {
-		resp.Error = "Execution failed"
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(resp)
-
-	totalMs := time.Since(start).Milliseconds()
-	log.Printf("Run: exit=%d exec=%dms total=%dms timeout=%v",
-		exitCode, execMs, totalMs, timeout)
-}
-
-func runPython(jobDir, source string) (output string, exitCode int, execMs int64, timeout, truncated bool) {
-	srcFile := filepath.Join(jobDir, "main.py")
-	if err := os.WriteFile(srcFile, []byte(source), 0644); err != nil {
-		return fmt.Sprintf("Failed to write source: %v", err), -1, 0, false, false
+	srcFile := filepath.Join(jobDir, srcFilename)
+	if err := os.WriteFile(srcFile, []byte(req.Source), 0644); err != nil {
+		writeError(w, http.StatusInternalServerError, "Failed to write source", 0, 0)
+		return
 	}
 
 	execStart := time.Now()
-	ctx, cancel := context.WithTimeout(context.Background(), maxExecTime)
-	defer cancel()
+	output, exitCode, timedOut := runCommand(context.Background(), maxExecTime, jobDir, "python3", srcFile)
+	execMs := time.Since(execStart).Milliseconds()
 
-	cmd := exec.CommandContext(ctx, "python3", srcFile)
-	var stdout, stderr strings.Builder
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	err := cmd.Run()
-	execMs = time.Since(execStart).Milliseconds()
-
-	if ctx.Err() == context.DeadlineExceeded {
-		return "Execution timed out (limit: 10s)", -1, execMs, true, false
-	}
-
-	combinedOutput := stdout.String() + stderr.String()
-	if len(combinedOutput) > maxOutputSize {
-		combinedOutput = combinedOutput[:maxOutputSize] + "\n... [output truncated]"
+	truncated := false
+	if len(output) > maxOutputSize {
+		output = output[:maxOutputSize]
 		truncated = true
 	}
 
-	output = combinedOutput
-	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			exitCode = exitErr.ExitCode()
-		} else {
-			exitCode = 1
-		}
-	} else {
-		exitCode = 0
+	resp := CompileResponse{
+		Success:         exitCode == 0,
+		Output:          string(output),
+		ExitCode:        exitCode,
+		CompileTime:     0,
+		ExecuteTime:     execMs,
+		Timeout:         timedOut,
+		OutputTruncated: truncated,
+	}
+	if timedOut {
+		resp.Error = "Execution timed out (limit: 10s)"
+	} else if exitCode != 0 && resp.Output == "" {
+		resp.Error = "Execution failed"
 	}
 
-	return
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(resp)
+
+	log.Printf("Compile: exit=%d exec=%dms total=%dms timeout=%v",
+		exitCode, execMs, time.Since(start).Milliseconds(), timedOut)
 }
 
 func writeError(w http.ResponseWriter, status int, message string, compileMs, execMs int64) {
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(CompileResponse{
 		Success:     false,
