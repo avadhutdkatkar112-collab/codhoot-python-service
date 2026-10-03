@@ -17,7 +17,7 @@ const (
 	maxOutputSize     = 512 * 1024 // 512KB
 	maxSourceSize     = 100 * 1024 // 100KB
 	maxExecTime       = 10 * time.Second
-	maxConcurrentJobs = 4
+	maxConcurrentJobs = 8
 	workspaceDir      = "/tmp/codhoot-workspace"
 	srcFilename       = "main.py"
 )
