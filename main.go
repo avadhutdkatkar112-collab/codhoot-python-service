@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
-	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -25,6 +24,10 @@ const (
 
 type CompileRequest struct {
 	Source string `json:"source"`
+	// Files plus EntryFile enable the multi-file contract the backend uses.
+	// Source is still accepted so older callers keep working.
+	Files     map[string]string `json:"files,omitempty"`
+	EntryFile string            `json:"entry_file,omitempty"`
 }
 
 type CompileResponse struct {
@@ -185,14 +188,17 @@ func handleCompile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if strings.TrimSpace(req.Source) == "" {
-		writeError(w, http.StatusBadRequest, "Source code is required", 0, 0)
-		return
-	}
-
-	if len(req.Source) > maxSourceSize {
-		writeError(w, http.StatusBadRequest, "Source code exceeds maximum size", 0, 0)
-		return
+	// A multi-file request carries no source field; resolveEntry validates the
+	// file set instead, so these single-source checks apply only when it is absent.
+	if len(req.Files) == 0 {
+		if strings.TrimSpace(req.Source) == "" {
+			writeError(w, http.StatusBadRequest, "Source code is required", 0, 0)
+			return
+		}
+		if len(req.Source) > maxSourceSize {
+			writeError(w, http.StatusBadRequest, "Source code exceeds maximum size", 0, 0)
+			return
+		}
 	}
 
 	select {
@@ -216,8 +222,13 @@ func handleCompile(w http.ResponseWriter, r *http.Request) {
 	}
 	defer os.RemoveAll(jobDir)
 
-	srcFile := filepath.Join(jobDir, srcFilename)
-	if err := os.WriteFile(srcFile, []byte(req.Source), 0644); err != nil {
+	ep, err := resolveEntry(req.Source, req.Files, req.EntryFile, srcFilename)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error(), 0, 0)
+		return
+	}
+	srcFile, werr := writeEntry(jobDir, ep, uid)
+	if werr != nil {
 		writeError(w, http.StatusInternalServerError, "Failed to write source", 0, 0)
 		return
 	}
