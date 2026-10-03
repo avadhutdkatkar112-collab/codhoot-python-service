@@ -26,8 +26,8 @@ type CompileRequest struct {
 	Source string `json:"source"`
 	// Files plus EntryFile enable the multi-file contract the backend uses.
 	// Source is still accepted so older callers keep working.
-	Files     map[string]string `json:"files,omitempty"`
-	EntryFile string            `json:"entry_file,omitempty"`
+	Files     []File `json:"files,omitempty"`
+	EntryFile string `json:"entry_file,omitempty"`
 }
 
 type CompileResponse struct {
@@ -244,7 +244,7 @@ func handleCompile(w http.ResponseWriter, r *http.Request) {
 	execMs := time.Since(execStart).Milliseconds()
 
 	truncated := false
-	if len(output) > maxOutputSize {
+	if len(output) >= maxOutputSize {
 		output = output[:maxOutputSize]
 		truncated = true
 	}
