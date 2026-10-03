@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -46,7 +45,18 @@ type HealthResponse struct {
 
 var jobSem = make(chan struct{}, maxConcurrentJobs)
 
+// uids hands each in-flight job its own sandbox uid so a job's working directory
+// is genuinely private to it. See harden.go for why a single shared uid is not
+// isolation.
+var uids = newUIDPool()
+
 func main() {
+	// Sandboxed path: when re-invoked as the trampoline, apply rlimits and exec
+	// the real compiler or runtime. Returns only if the trampoline fails.
+	if sandboxExec() {
+		return
+	}
+
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8081"
@@ -111,20 +121,35 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 
 // runCommand runs a command, killing the whole process group on timeout so
 // orphaned children never accumulate on the 512MB container.
-func runCommand(parent context.Context, timeout time.Duration, dir string, name string, args ...string) ([]byte, int, bool) {
+//
+// Every child is confined to uid's private job directory, run with a fixed
+// minimal environment, capped by rlimits, and its output is captured through a
+// bounded writer so a runaway program cannot exhaust the service's memory.
+func runCommand(parent context.Context, timeout time.Duration, dir string, uid uint32, name string, args ...string) ([]byte, int, bool) {
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, name, args...)
+	self, err := selfPath()
+	if err != nil {
+		return nil, -1, false
+	}
+
+	// Run the sandbox trampoline (this same binary), which applies rlimits and
+	// then execs the real target. That is how rlimits get applied at all, since
+	// Go's os/exec cannot set them in a child.
+	full := append([]string{sandboxExecFlag, name}, args...)
+
+	cmd := exec.CommandContext(ctx, self, full...)
 	cmd.Dir = dir
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Env = childEnv(dir)
+	cmd.SysProcAttr = hardenProcAttr(uid)
 
 	killGroup := func() {
 		for i := 0; i < 200 && (cmd.Process == nil || cmd.Process.Pid <= 0); i++ {
 			time.Sleep(10 * time.Millisecond)
 		}
 		if cmd.Process != nil && cmd.Process.Pid > 0 {
-			syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+			killProcessGroup(cmd.Process.Pid)
 		}
 	}
 	go func() {
@@ -132,12 +157,17 @@ func runCommand(parent context.Context, timeout time.Duration, dir string, name 
 		killGroup()
 	}()
 
-	out, err := cmd.CombinedOutput()
+	cw := &cappedWriter{max: maxOutputSize}
+	cmd.Stdout = cw
+	cmd.Stderr = cw
+	runErr := cmd.Run()
+
+	out := cw.Bytes()
 	if ctx.Err() == context.DeadlineExceeded {
 		return out, -1, true
 	}
-	if err != nil {
-		if ee, ok := err.(*exec.ExitError); ok {
+	if runErr != nil {
+		if ee, ok := runErr.(*exec.ExitError); ok {
 			return out, ee.ExitCode(), false
 		}
 		return out, 1, false
@@ -149,6 +179,7 @@ func handleCompile(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 
 	var req CompileRequest
+	limitBody(w, r)
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "Invalid request body", 0, 0)
 		return
@@ -172,9 +203,17 @@ func handleCompile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	jobID := fmt.Sprintf("%d", time.Now().UnixNano())
-	jobDir := filepath.Join(workspaceDir, jobID)
-	os.MkdirAll(jobDir, 0755)
+	// Each job gets its own uid and a private random 0700 directory. Sharing one
+	// predictable directory let concurrent jobs read each other's source and
+	// rewrite it before it was executed.
+	uid := uids.acquire()
+	defer uids.release(uid)
+
+	jobDir, err := newJobDir(uid)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "Failed to create workspace", 0, 0)
+		return
+	}
 	defer os.RemoveAll(jobDir)
 
 	srcFile := filepath.Join(jobDir, srcFilename)
@@ -182,9 +221,15 @@ func handleCompile(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "Failed to write source", 0, 0)
 		return
 	}
+	// The file was created by the service (root); give it to the sandbox uid so
+	// the unprivileged interpreter can read it and nothing else can.
+	if err := os.Chown(srcFile, int(uid), int(uid)); err != nil {
+		writeError(w, http.StatusInternalServerError, "Failed to write source", 0, 0)
+		return
+	}
 
 	execStart := time.Now()
-	output, exitCode, timedOut := runCommand(context.Background(), maxExecTime, jobDir, "python3", srcFile)
+	output, exitCode, timedOut := runCommand(context.Background(), maxExecTime, jobDir, uid, "python3", srcFile)
 	execMs := time.Since(execStart).Milliseconds()
 
 	truncated := false
@@ -193,9 +238,11 @@ func handleCompile(w http.ResponseWriter, r *http.Request) {
 		truncated = true
 	}
 
+	// Strip terminal control sequences and internal paths before the client sees it.
+	clean := sanitizeOutput(string(output), jobDir)
 	resp := CompileResponse{
 		Success:         exitCode == 0,
-		Output:          string(output),
+		Output:          clean,
 		ExitCode:        exitCode,
 		CompileTime:     0,
 		ExecuteTime:     execMs,
