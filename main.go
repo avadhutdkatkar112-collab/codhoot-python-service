@@ -8,18 +8,18 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 )
 
 const (
-	maxOutputSize     = 512 * 1024 // 512KB
-	maxSourceSize     = 100 * 1024 // 100KB
-	maxExecTime       = 10 * time.Second
-	maxConcurrentJobs = 8
-	workspaceDir      = "/tmp/codhoot-workspace"
-	srcFilename       = "main.py"
+	maxOutputSize = 512 * 1024 // 512KB
+	maxSourceSize = 100 * 1024 // 100KB
+	maxExecTime   = 10 * time.Second
+	workspaceDir  = "/tmp/codhoot-workspace"
+	srcFilename   = "main.py"
 )
 
 type CompileRequest struct {
@@ -44,6 +44,29 @@ type CompileResponse struct {
 type HealthResponse struct {
 	Status    string `json:"status"`
 	Timestamp string `json:"timestamp"`
+}
+
+// maxConcurrentJobs bounds concurrent compiler+runner processes so a burst of
+// students cannot OOM the 512MB free-tier container (which would restart it and
+// wipe every warm cache). Requests queue up to their own deadline instead.
+//
+// The default is this language's COMPILER_CONCURRENCY_* on the backend, so the
+// service remains the ceiling even if that configuration drifts upward: the box
+// is 0.1 CPU with 512 MB, and each in-flight toolchain costs both a timeslice
+// and real memory. MAX_CONCURRENT_JOBS overrides it per deployment.
+var maxConcurrentJobs = concurrentJobsFromEnv(4)
+
+// concurrentJobsFromEnv reads MAX_CONCURRENT_JOBS, clamped to 1..8 so a typo
+// cannot silently remove the ceiling.
+func concurrentJobsFromEnv(def int) int {
+	n, err := strconv.Atoi(os.Getenv("MAX_CONCURRENT_JOBS"))
+	if err != nil || n < 1 {
+		return def
+	}
+	if n > 8 {
+		return 8
+	}
+	return n
 }
 
 var jobSem = make(chan struct{}, maxConcurrentJobs)
@@ -87,7 +110,7 @@ func main() {
 		Addr:         ":" + port,
 		Handler:      handler,
 		ReadTimeout:  30 * time.Second,
-		WriteTimeout: maxExecTime + 10*time.Second,
+		WriteTimeout: maxExecTime + 20*time.Second,
 		IdleTimeout:  60 * time.Second,
 	}
 
